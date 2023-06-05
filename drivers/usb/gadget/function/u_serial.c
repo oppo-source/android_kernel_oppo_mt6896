@@ -81,6 +81,11 @@
 #define WRITE_BUF_SIZE		8192		/* TX only */
 #define GS_CONSOLE_BUF_SIZE	8192
 
+/* Prevents race conditions while accessing gser->ioport */
+#ifdef OPLUS_FEATURE_CHG_BASIC
+static DEFINE_SPINLOCK(serial_port_lock);
+#endif
+
 /* console info */
 struct gs_console {
 	struct console		console;
@@ -1374,8 +1379,14 @@ void gserial_disconnect(struct gserial *gser)
 	if (!port)
 		return;
 
+#ifdef OPLUS_FEATURE_CHG_BASIC
+	spin_lock_irqsave(&serial_port_lock, flags);
+
+	spin_lock(&port->port_lock);
+#else
 	/* tell the TTY glue not to do I/O here any more */
 	spin_lock_irqsave(&port->port_lock, flags);
+#endif
 
 	gs_console_disconnect(port);
 
@@ -1390,7 +1401,12 @@ void gserial_disconnect(struct gserial *gser)
 			tty_hangup(port->port.tty);
 	}
 	port->suspended = false;
+#ifdef OPLUS_FEATURE_CHG_BASIC
+	spin_unlock(&port->port_lock);
+	spin_unlock_irqrestore(&serial_port_lock, flags);
+#else
 	spin_unlock_irqrestore(&port->port_lock, flags);
+#endif
 
 	/* disable endpoints, aborting down any active I/O */
 	usb_ep_disable(gser->out);
@@ -1413,10 +1429,27 @@ EXPORT_SYMBOL_GPL(gserial_disconnect);
 
 void gserial_suspend(struct gserial *gser)
 {
+#ifdef OPLUS_FEATURE_CHG_BASIC
+	struct gs_port *port;
+#else
 	struct gs_port	*port = gser->ioport;
+#endif
 	unsigned long	flags;
 
+#ifdef OPLUS_FEATURE_CHG_BASIC
+	spin_lock_irqsave(&serial_port_lock, flags);
+	port = gser->ioport;
+
+	if (!port) {
+		spin_unlock_irqrestore(&serial_port_lock, flags);
+		return;
+	}
+
+	spin_lock(&port->port_lock);
+	spin_unlock(&serial_port_lock);
+#else
 	spin_lock_irqsave(&port->port_lock, flags);
+#endif
 	port->suspended = true;
 	spin_unlock_irqrestore(&port->port_lock, flags);
 }
@@ -1424,10 +1457,27 @@ EXPORT_SYMBOL_GPL(gserial_suspend);
 
 void gserial_resume(struct gserial *gser)
 {
+#ifdef OPLUS_FEATURE_CHG_BASIC
+	struct gs_port *port;
+#else
 	struct gs_port *port = gser->ioport;
+#endif
 	unsigned long	flags;
 
+#ifdef OPLUS_FEATURE_CHG_BASIC
+	spin_lock_irqsave(&serial_port_lock, flags);
+	port = gser->ioport;
+
+	if (!port) {
+		spin_unlock_irqrestore(&serial_port_lock, flags);
+		return;
+	}
+
+	spin_lock(&port->port_lock);
+	spin_unlock(&serial_port_lock);
+#else
 	spin_lock_irqsave(&port->port_lock, flags);
+#endif
 	port->suspended = false;
 	if (!port->start_delayed) {
 		spin_unlock_irqrestore(&port->port_lock, flags);
