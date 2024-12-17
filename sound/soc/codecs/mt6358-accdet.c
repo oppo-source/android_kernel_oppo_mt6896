@@ -64,6 +64,12 @@
 #define EINT_PLUG_IN			(1)
 #define EINT_MOISTURE_DETECTED	(2)
 
+#ifndef OPLUS_BUG_COMPATIBILITY
+#define OPLUS_BUG_COMPATIBILITY
+#endif /* OPLUS_BUG_COMPATIBILITY */
+
+static bool is_hp_switch = false;
+
 struct mt63xx_accdet_data {
 	u32 base;
 	struct snd_soc_card card;
@@ -113,6 +119,13 @@ struct mt63xx_accdet_data {
 	/* when eint issued, queue work: eint_work */
 	struct work_struct eint_work;
 	struct workqueue_struct *eint_workqueue;
+#ifdef OPLUS_BUG_COMPATIBILITY
+	struct delayed_work hp_detect_work;
+#endif
+#ifdef CONFIG_HSKEY_BLOCK
+	struct delayed_work hskey_block_work;
+	bool g_hskey_block_flag;
+#endif /* CONFIG_HSKEY_BLOCK */
 	u32 water_r;
 	u32 moisture_ext_r;
 	u32 moisture_int_r;
@@ -776,6 +789,13 @@ static void send_key_event(u32 keycode, u32 flag)
 {
 	int report = 0;
 
+#ifdef CONFIG_HSKEY_BLOCK
+	pr_info("[accdet][send_key_event]g_hskey_block_flag = %d\n", accdet->g_hskey_block_flag);
+	if (accdet->g_hskey_block_flag) {
+		pr_info("[accdet][send_key_event]No key event in 1s after inserting 4-pole headsets\n");
+		return;
+	}
+#endif /* CONFIG_HSKEY_BLOCK */
 	switch (keycode) {
 	case DW_KEY:
 		if (flag != 0)
@@ -1173,6 +1193,13 @@ static void eint_work_callback(struct work_struct *work)
 		enable_irq(accdet->gpioirq);
 
 }
+#ifdef CONFIG_HSKEY_BLOCK
+static void disable_hskey_block_callback(struct work_struct *work)
+{
+	pr_info("[accdet][disable_hskey_block_callback]:\n");
+	accdet->g_hskey_block_flag = false;
+}
+#endif /* CONFIG_HSKEY_BLOCK */
 
 void accdet_set_debounce(int state, unsigned int debounce)
 {
@@ -1378,8 +1405,26 @@ static int pmic_eint_queue_work(int eintID)
 					jiffies + MICBIAS_DISABLE_TIMER);
 				}
 			}
+#ifndef OPLUS_BUG_COMPATIBILITY
 			ret = queue_work(accdet->eint_workqueue,
 					&accdet->eint_work);
+#else
+			if (accdet->cur_eint_state == EINT_PLUG_IN) {
+				pr_info("%s delayed work 500ms scheduled when plugging in\n", __func__);
+				schedule_delayed_work(&accdet->hp_detect_work, msecs_to_jiffies(500));
+#ifdef CONFIG_HSKEY_BLOCK
+				accdet->g_hskey_block_flag = true;
+				schedule_delayed_work(&accdet->hskey_block_work, msecs_to_jiffies(1500));
+#endif /* CONFIG_HSKEY_BLOCK */
+			} else {
+				pr_info("[accdet_eint_func]delayed work 0ms scheduled when plugging out\n");
+				cancel_delayed_work_sync(&accdet->hp_detect_work);
+				schedule_delayed_work(&accdet->hp_detect_work, 0);
+#ifdef CONFIG_HSKEY_BLOCK
+				cancel_delayed_work_sync(&accdet->hskey_block_work);
+#endif /* CONFIG_HSKEY_BLOCK */
+			}
+#endif
 		} else
 			pr_notice("%s invalid EINT ID!\n", __func__);
 	} else if (HAS_CAP(accdet->data->caps, ACCDET_PMIC_EINT1)) {
@@ -1577,6 +1622,40 @@ static irqreturn_t mtk_accdet_irq_handler_thread(int irq, void *data)
 	return IRQ_HANDLED;
 }
 
+#if IS_ENABLED(CONFIG_SND_SOC_OPLUS_TYPEC_SWITCH)
+/* 2024/8/9, add for supporting type-c headphone detect bypass */
+extern void register_ext_eint_handler(int (*phandler)(void));
+
+int typec_sw_eint_handler(void)
+{
+	int ret = 0;
+	pr_notice("Error: %s called\n",
+			__func__);
+
+	if (accdet->cur_eint_state == EINT_PLUG_IN) {
+		/* To trigger EINT when the headset was plugged in
+		 * We set the polarity back as we initialed.
+		 */
+		accdet->cur_eint_state = EINT_PLUG_OUT;
+	} else {
+		/* To trigger EINT when the headset was plugged out
+		 * We set the opposite polarity to what we initialed.
+		 */
+
+		accdet->cur_eint_state = EINT_PLUG_IN;
+
+		if (accdet_dts.moisture_detect_mode != 0x5) {
+			mod_timer(&micbias_timer,
+				jiffies + MICBIAS_DISABLE_TIMER);
+		}
+
+	}
+
+	ret = queue_work(accdet->eint_workqueue, &accdet->eint_work);
+	return IRQ_HANDLED;
+}
+#endif
+
 static irqreturn_t ex_eint_handler(int irq, void *data)
 {
 	int ret = 0;
@@ -1704,6 +1783,7 @@ static int accdet_get_dts_data(void)
 
 	ret = of_property_read_u32_array(node, "headset-mode-setting", pwm_deb,
 			ARRAY_SIZE(pwm_deb));
+	is_hp_switch = of_property_read_bool(node, "is_hp_switch");
 	/* debounce8(auxadc debounce) is default, needn't get from dts */
 	if (!ret)
 		memcpy(&accdet_dts.pwm_deb, pwm_deb, sizeof(pwm_deb));
@@ -1817,6 +1897,18 @@ static int accdet_get_dts_data(void)
 		/* eint use internal resister */
 		accdet_dts.eint_use_ext_res = 0x0;
 	}
+#if IS_ENABLED(CONFIG_SND_SOC_OPLUS_TYPEC_SWITCH)
+	/* 2024/8/9, add for supporting type-c headphone detect bypass*/
+	/* if headset eint0 disable, the pmic eint0 is not be used */
+	ret = of_property_read_u32(node,
+			"headset-eint0-disable", &accdet_dts.headset_eint0_disable);
+	if (ret) {
+		/* enable eint0 */
+		pr_info("%s: read prop headset-eint0-disable fail\n", __func__);
+		accdet_dts.headset_eint0_disable = 0;
+	}
+	register_ext_eint_handler(typec_sw_eint_handler);
+#endif
 	return 0;
 }
 
@@ -1968,17 +2060,17 @@ static void accdet_init_once(void)
 				RG_AUDMICBIAS1DCSW1PEN_SFT);
 	}
 	/* enable analog fast discharge */
-
-	if (accdet_dts.eint_pol == IRQ_TYPE_LEVEL_LOW) {
-		reg = accdet_read(RG_AUDSPARE_ADDR);
-		accdet_write(RG_AUDSPARE_ADDR, reg |
-			RG_AUDSPARE_FSTDSCHRG_IMPR_EN |
-			RG_AUDSPARE_FSTDSCHRG_ANALOG_DIR_EN);
-	} else {
-		reg = accdet_read(RG_AUDSPARE_ADDR);
-		accdet_write(RG_AUDSPARE_ADDR, (reg & (0xE0)));
+	if(!is_hp_switch){
+		if (accdet_dts.eint_pol == IRQ_TYPE_LEVEL_LOW) {
+			reg = accdet_read(RG_AUDSPARE_ADDR);
+			accdet_write(RG_AUDSPARE_ADDR, reg |
+					RG_AUDSPARE_FSTDSCHRG_IMPR_EN |
+					RG_AUDSPARE_FSTDSCHRG_ANALOG_DIR_EN);
+		} else {
+			reg = accdet_read(RG_AUDSPARE_ADDR);
+			accdet_write(RG_AUDSPARE_ADDR, (reg & (0xE0)));
+		}
 	}
-
 	if (HAS_CAP(accdet->data->caps, ACCDET_PMIC_EINT_IRQ)) {
 		config_eint_init_by_mode();
 		config_digital_init_by_mode();
@@ -1989,7 +2081,16 @@ static void accdet_init_once(void)
 
 	/* accdet eint enable*/
 	accdet_write(0x250a, 0x4);
-
+#if IS_ENABLED(CONFIG_SND_SOC_OPLUS_TYPEC_SWITCH)
+	/* 2024/8/9, add for supporting type-c headphone detect bypass*/
+	/* pmic eint0 disable*/
+	if (accdet_dts.headset_eint0_disable) {
+		//1.disable eint0
+		accdet_clear_bit(ACCDET_EN_ADDR, ACCDET_EINT0_EN_SFT);
+		//disable fast discharge
+		accdet_clear_bits(RG_AUDSPARE_ADDR, 0x5, 0x3, 0x3);
+	}
+#endif
 	pr_info("%s done!\n", __func__);
 }
 
@@ -2083,6 +2184,22 @@ int mt6358_accdet_init(struct snd_soc_component *component,
 	return ret;
 }
 EXPORT_SYMBOL_GPL(mt6358_accdet_init);
+
+#if IS_ENABLED(CONFIG_SND_SOC_FSA)
+void typec_headset_queue_work(bool plug_flag)
+{
+	if (plug_flag){
+		accdet->cur_eint_state = EINT_PLUG_IN;
+		mod_timer(&micbias_timer, (jiffies + MICBIAS_DISABLE_TIMER));
+	} else {
+		accdet->cur_eint_state = EINT_PLUG_OUT;
+	}
+	queue_work(accdet->eint_workqueue, &accdet->eint_work);
+	pr_info("%s() end! cur_eint_state = %d\n", __func__, accdet->cur_eint_state);
+}
+EXPORT_SYMBOL_GPL(typec_headset_queue_work);
+#endif
+
 
 static int mt6358_accdet_probe(struct platform_device *pdev)
 {
@@ -2300,7 +2417,12 @@ static int mt6358_accdet_probe(struct platform_device *pdev)
 		ret = -1;
 		goto err_create_workqueue;
 	}
-
+#ifdef OPLUS_BUG_COMPATIBILITY
+	INIT_DELAYED_WORK(&accdet->hp_detect_work, eint_work_callback);
+#endif
+#ifdef CONFIG_HSKEY_BLOCK
+	INIT_DELAYED_WORK(&accdet->hskey_block_work, disable_hskey_block_callback);
+#endif /* CONFIG_HSKEY_BLOCK */
 	if (HAS_CAP(accdet->data->caps, ACCDET_AP_GPIO_EINT)) {
 		accdet->accdet_eint_type = IRQ_TYPE_LEVEL_LOW;
 		ret = ext_eint_setup(pdev);
