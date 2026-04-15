@@ -1106,6 +1106,10 @@ void clk_unprepare(struct clk *clk)
 {
 	if (IS_ERR_OR_NULL(clk))
 		return;
+	if (strcmp("img_gals", clk->core->name) == 0) {
+		pr_info("%s: img_gals\n", __func__);
+		dump_stack();
+	}
 
 	clk_core_unprepare_lock(clk->core);
 }
@@ -1187,7 +1191,10 @@ int clk_prepare(struct clk *clk)
 {
 	if (!clk)
 		return 0;
-
+	if (strcmp("img_gals", clk->core->name) == 0) {
+		pr_info("%s: img_gals\n", __func__);
+		dump_stack();
+	}
 	return clk_core_prepare_lock(clk->core);
 }
 EXPORT_SYMBOL_GPL(clk_prepare);
@@ -1199,6 +1206,9 @@ static void clk_core_disable(struct clk_core *core)
 	if (!core)
 		return;
 
+	if (strcmp(core->name, "img1_sel") == 0)
+		dump_stack();
+
 	if (WARN(core->enable_count == 0, "%s already disabled\n", core->name))
 		return;
 
@@ -1206,7 +1216,12 @@ static void clk_core_disable(struct clk_core *core)
 	    "Disabling critical %s\n", core->name))
 		return;
 
-	if (--core->enable_count > 0)
+	core->enable_count--;
+
+	if (strcmp(core->name, "img1_sel") == 0)
+		pr_info("[MTK-YG] %s, clk_name: %s, enable_count: %d\n", __func__, core->name, core->enable_count);
+
+	if (core->enable_count > 0)
 		return;
 
 	trace_clk_disable(core);
@@ -1244,7 +1259,10 @@ void clk_disable(struct clk *clk)
 {
 	if (IS_ERR_OR_NULL(clk))
 		return;
-
+	if (strcmp("img_gals", clk->core->name) == 0) {
+		pr_info("%s: img_gals\n", __func__);
+		dump_stack();
+	}
 	clk_core_disable_lock(clk->core);
 }
 EXPORT_SYMBOL_GPL(clk_disable);
@@ -1257,6 +1275,9 @@ static int clk_core_enable(struct clk_core *core)
 
 	if (!core)
 		return 0;
+
+	if (strcmp(core->name, "img1_sel") == 0)
+		dump_stack();
 
 	if (WARN(core->prepare_count == 0,
 	    "Enabling unprepared %s\n", core->name))
@@ -1282,6 +1303,10 @@ static int clk_core_enable(struct clk_core *core)
 	}
 
 	core->enable_count++;
+
+	if (strcmp(core->name, "img1_sel") == 0)
+		pr_info("[MTK-YG] %s, clk_name: %s, enable_count: %d\n", __func__, core->name, core->enable_count);
+
 	return 0;
 }
 
@@ -1409,7 +1434,10 @@ int clk_enable(struct clk *clk)
 {
 	if (!clk)
 		return 0;
-
+	if (strcmp("img_gals", clk->core->name) == 0) {
+		pr_info("%s: img_gals\n", __func__);
+		dump_stack();
+	}
 	return clk_core_enable_lock(clk->core);
 }
 EXPORT_SYMBOL_GPL(clk_enable);
